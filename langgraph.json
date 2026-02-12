@@ -1,0 +1,12 @@
+{
+  "dockerfile_lines": [],
+  "graphs": {
+    "admin_graph": "./app/graph/admin_graph.py:admin_graph",
+    "user_graph": "./app/graph/user_graph.py:orchestrator_graph"
+  },
+  "env": "./.env",
+  "python_version": "3.11",
+  "dependencies": [
+    "."
+  ]
+}
