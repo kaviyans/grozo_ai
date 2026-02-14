@@ -8,17 +8,29 @@ from langsmith import traceable
 from app.core.state import GraphState
 from app.core.runtime import RuntimeContext
 from app.core.model import get_llm, get_vector_db
+from app.core.logging_config import (
+    get_graph_logger,
+    log_node_entry,
+    log_node_exit,
+    log_node_error
+)
+
+from app.core.schema import DB_SCHEMA
 
 from app.utils.sql_executor import execute_sql
 from app.utils.sql_validator import validate_sql, sanitize_sql
 from app.core.schema import DB_SCHEMA
+
+# ---------- LOGGER ----------
+logger = get_graph_logger("chat_graph")
 
 from app.utils.helper import (
     get_product_details,
     get_product_reviews,
     get_product_ratings,
     get_faqs,
-    get_policy_by_type
+    get_policy_by_type,
+    get_available_categories
 )
 
 from app.memory.chat_memory import get_history, save_message
@@ -40,10 +52,19 @@ llm = get_llm()
 vector_store = get_vector_db()
 
 
+# ---------- ASYNC VECTOR SEARCH ----------
+async def async_vector_search(query: str, k: int = 4):
+    """Run vector search in a thread pool to make it async."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, lambda: vector_store.similarity_search(query, k=k))
+
+
 # ---------- INTENT DETECTION ----------
 @traceable(name="intent_detection")
 async def detect_intent(state: GraphState):
-    prompt = f"""
+    log_node_entry(logger, "detect_intent", list(state.keys()))
+    try:
+        prompt = f"""
     You are an intent classification system for an e-commerce assistant.
 
     Your task is to classify the user's query into exactly ONE of the following intents:
@@ -108,23 +129,35 @@ async def detect_intent(state: GraphState):
     normal_query
     blocked_query
     """
-    response = await llm.ainvoke(prompt)
-    print("Intent response:  ",response.content.strip().lower())
-    return {"intent": response.content.strip().lower()}
+        response = await llm.ainvoke(prompt)
+        intent = response.content.strip().lower()
+        logger.info(f"[detect_intent] Intent detected: {intent}")
+        log_node_exit(logger, "detect_intent", ["intent"], f"intent={intent}")
+        return {"intent": intent}
+    except Exception as e:
+        log_node_error(logger, "detect_intent", e)
+        return {"intent": "normal_query"}
 
 
 # ---------- NORMALIZE QUERY ----------
 @traceable(name="normalize_query")
 async def normalize_query_llm(query: str) -> str:
-    prompt = f"""
-    Extract the core product name from the user query.
-    Remove intent phrases.
-    Return ONLY product keywords.
+    try:
+        logger.debug(f"[normalize_query_llm] Normalizing: {query[:50]}...")
+        prompt = f"""
+        Extract the core product name from the user query.
+        Remove intent phrases.
+        Return ONLY product keywords.
 
-    Query: {query}
-    """
-    response = await llm.ainvoke(prompt)
-    return response.content.strip().lower()
+        Query: {query}
+        """
+        response = await llm.ainvoke(prompt)
+        normalized = response.content.strip().lower()
+        logger.debug(f"[normalize_query_llm] Result: {normalized}")
+        return normalized
+    except Exception as e:
+        log_node_error(logger, "normalize_query_llm", e)
+        return query.lower()
 
 
 # ---------- STRUCTURED DB CALLS ----------
@@ -133,81 +166,107 @@ async def product_db_node(
     state: GraphState,
     runtime: Runtime[RuntimeContext]
 ):
-    query = await normalize_query_llm(state["query"])
+    log_node_entry(logger, "product_db_node", list(state.keys()))
+    try:
+        query = await normalize_query_llm(state["query"])
 
-    products = await get_product_details(query, runtime)  
-    reviews = await get_product_reviews(query, runtime)
-    ratings = await get_product_ratings(query, runtime)
-    faqs = await get_faqs()
+        products = await get_product_details(query, runtime)  
+        reviews = await get_product_reviews(query, runtime)
+        ratings = await get_product_ratings(query, runtime)
+        faqs = await get_faqs()
 
-    return {
-        "products": products, 
-        "reviews": reviews,
-        "ratings": ratings,
-        "faqs": faqs
-    }
+        logger.info(f"[product_db_node] Found {len(products)} products")
+        log_node_exit(logger, "product_db_node", ["products", "reviews", "ratings", "faqs"])
+        return {
+            "products": products, 
+            "reviews": reviews,
+            "ratings": ratings,
+            "faqs": faqs
+        }
+    except Exception as e:
+        log_node_error(logger, "product_db_node", e)
+        return {"products": [], "reviews": [], "ratings": None, "faqs": []}
 
 
 # ---------- MONGODB CALLS ----------
 @traceable(name="policy_db_fetch")
 async def policy_db_node(state: GraphState):
-    query = await normalize_query_llm(state["query"])
-    
-    data = {"policy": await get_policy_by_type(query)}
-    # print(data)
-    return data
+    log_node_entry(logger, "policy_db_node", list(state.keys()))
+    try:
+        query = await normalize_query_llm(state["query"])
+        
+        data = {"policy": await get_policy_by_type(query)}
+        logger.info(f"[policy_db_node] Policy found: {bool(data.get('policy'))}")
+        log_node_exit(logger, "policy_db_node", ["policy"])
+        return data
+    except Exception as e:
+        log_node_error(logger, "policy_db_node", e)
+        return {"policy": None}
 
 
 # ---------- RAG RETRIEVER ----------
 @traceable(name="rag_retriever")
 async def rag_node(state: GraphState):
-    query = state["query"]
+    log_node_entry(logger, "rag_node", list(state.keys()))
+    try:
+        query = state["query"]
 
-    docs = vector_store.similarity_search(query, k=4)
-    rag_text = "\n".join(d.page_content for d in docs)
-    
-    # print("rag_text:    ",rag_text)
-    return {"rag_context": rag_text}
+        docs = await async_vector_search(query, k=4)
+        rag_text = "\n".join(d.page_content for d in docs)
+        
+        logger.info(f"[rag_node] Retrieved {len(docs)} documents")
+        log_node_exit(logger, "rag_node", ["rag_context"])
+        return {"rag_context": rag_text}
+    except Exception as e:
+        log_node_error(logger, "rag_node", e)
+        return {"rag_context": ""}
 
 
 # ---------- ASSEMBLER ----------
 @traceable(name="context_assembler")
 async def assemble_context(state: GraphState):
-    sections = []
-    products = state.get("products", [])
-    if products:
-        product_lines = ["PRODUCT DETAILS:"]
-        for idx, product in enumerate(products, start=1):
-            product_lines.append(f"\n--- Product {idx} ---")
-            product_lines.append(f"  Name: {product.get('name', 'N/A')}")
-            product_lines.append(f"  Price: ${product.get('selling_price', 'N/A')}")
-            if product.get('price') and product.get('price') != product.get('selling_price'):
-                product_lines.append(f"  Original Price: ${product.get('price')}")
-            product_lines.append(f"  Rating: {product.get('average_rating', 'No ratings')} ({product.get('rating_count', 0)} reviews)")
-            product_lines.append(f"  Category: {product.get('category_name', 'N/A')}")
-            if product.get('tags'):
-                product_lines.append(f"  Tags: {product.get('tags')}")
-            if product.get('description'):
-                desc = product.get('description', '')[:200] 
-                product_lines.append(f"  Description: {desc}...")
-        sections.append("\n".join(product_lines))
+    log_node_entry(logger, "assemble_context", list(state.keys()))
+    try:
+        sections = []
+        products = state.get("products", [])
+        if products:
+            product_lines = ["PRODUCT DETAILS:"]
+            for idx, product in enumerate(products, start=1):
+                product_lines.append(f"\n--- Product {idx} ---")
+                product_lines.append(f"  Name: {product.get('name', 'N/A')}")
+                product_lines.append(f"  Price: ${product.get('selling_price', 'N/A')}")
+                if product.get('price') and product.get('price') != product.get('selling_price'):
+                    product_lines.append(f"  Original Price: ${product.get('price')}")
+                product_lines.append(f"  Rating: {product.get('average_rating', 'No ratings')} ({product.get('rating_count', 0)} reviews)")
+                product_lines.append(f"  Category: {product.get('category_name', 'N/A')}")
+                if product.get('tags'):
+                    product_lines.append(f"  Tags: {product.get('tags')}")
+                if product.get('description'):
+                    desc = product.get('description', '')[:200] 
+                    product_lines.append(f"  Description: {desc}...")
+            sections.append("\n".join(product_lines))
 
-    if state.get("ratings"):
-        sections.append(f"RATINGS:\n{state['ratings']}")
+        if state.get("ratings"):
+            sections.append(f"RATINGS:\n{state['ratings']}")
 
-    if state.get("reviews"):
-        sections.append(f"REVIEWS:\n{state['reviews']}")
+        if state.get("reviews"):
+            sections.append(f"REVIEWS:\n{state['reviews']}")
 
-    if state.get("faqs"):
-        sections.append(f"FAQS:\n{state['faqs']}")
+        if state.get("faqs"):
+            sections.append(f"FAQS:\n{state['faqs']}")
 
-    if state.get("policy"):
-        sections.append(f"POLICY:\n{state['policy']}")
+        if state.get("policy"):
+            sections.append(f"POLICY:\n{state['policy']}")
 
-    if state.get("rag_context"):
-        sections.append(f"DOCUMENT CONTEXT:\n{state['rag_context']}")
+        if state.get("rag_context"):
+            sections.append(f"DOCUMENT CONTEXT:\n{state['rag_context']}")
 
-    return {"context": "\n\n".join(sections), "products": products}
+        logger.info(f"[assemble_context] Assembled {len(sections)} sections")
+        log_node_exit(logger, "assemble_context", ["context", "products"])
+        return {"context": "\n\n".join(sections), "products": products}
+    except Exception as e:
+        log_node_error(logger, "assemble_context", e)
+        return {"context": "", "products": []}
 
 
 # ---------- LIST PRODUCTS NODE (PREDEFINED SQL - NO LLM) ----------
@@ -219,48 +278,58 @@ async def list_products_node(state: GraphState):
     - Validate & execute safely
     - Fallback to static list if anything fails
     """
-
+    log_node_entry(logger, "list_products_node", list(state.keys()))
     user_query = state.get("query")
+    categories = await execute_sql("SELECT DISTINCT name FROM categories")
+    category_names = [row["name"] for row in categories]
+    categories_str = ", ".join(category_names)
+
 
     try:
         # ---------------- LLM SQL GENERATION ----------------
         prompt = f"""
         You are an expert PostgreSQL query generator for an e-commerce platform.
-
-        Database schema:
+        
+        Below is the db schema:
         {DB_SCHEMA}
+
+        Available categories currently in the database:
+        {categories_str}
 
         User input:
         "{user_query}"
 
-        Your task:
-        - Understand human intent and emotion (e.g., thirsty, hungry, tired, bored)
-        - Translate it into a PRODUCT SEARCH SQL query
+        Interpret human intent & emotion.
 
-        Emotion → Product mapping examples:
-        - thirsty → water, juice, soft drinks, beverages
-        - hungry → snacks, food, ready-to-eat
-        - tired → energy drinks, coffee, health drinks
-        - sleepy → comfort items (pillows, bedding)
-        - sick → mild, healthy, easy-to-consume items (NO medical claims)
+        STRICT RULES:
 
-        Rules:
+        - You MUST ONLY use categories from the list above
+        - NEVER invent categories or generic words like "food", "items", etc.
+        - Map intent to the MOST RELEVANT categories from the list
+
+        Examples:
+
+        - hungry → choose edible-related categories from the list
+        - thirsty → choose drink-related categories from the list
+        - cleaning / clean myself → choose hygiene or cleaning categories
+        - sleepy / tired → choose comfort / energy related categories
+
+        Query Requirements:
+
         - ONLY SELECT queries
-        - NO INSERT, UPDATE, DELETE, DROP, ALTER, TRUNCATE
-        - Use correct column names
-        - Always filter deleted_at IS NULL
-        - Prefer stock > 0
-        - Use LEFT JOINs for tags & categories
-        - If joining product_tags, you MUST aggregate tags using STRING_AGG
-        - Ensure one row per product using GROUP BY
-        - Match against:
-            * product name
-            * description
-            * category name
-            * tag name
-        - Always include LIMIT (max 20)
-        - Output ONLY the SQL query
-        - NO explanations
+        - Always filter p.deleted_at IS NULL
+        - Prefer p.stock > 0
+        - Use LEFT JOINs for categories & tags
+        - Aggregate tags using STRING_AGG
+        - Ensure one row per product (GROUP BY)
+        - Match AGAINST:
+            * p.name
+            * p.description
+            * c.name
+            * ptm.name
+
+        - Always include LIMIT 20
+        - Output ONLY SQL
         """
 
         result = await llm.ainvoke(prompt)
@@ -271,13 +340,17 @@ async def list_products_node(state: GraphState):
         try:
             await validate_sql(sql)
         except ValueError as ve:
-            print(f"[list_products_node] SQL validation failed: {ve}")
+            logger.warning(f"[list_products_node] SQL validation failed: {ve}")
             raise ve
 
         rows = await execute_sql(sql)
 
         if not rows:
-            raise ValueError("No rows returned")
+            return {
+                "answer": "I couldn’t find matching products. Want to try Snacks or Instant Foods?",
+                "confidence": 0.6
+            }
+
 
         # ---------------- FORMAT RESPONSE ----------------
         product_list = []
@@ -289,7 +362,8 @@ async def list_products_node(state: GraphState):
                 f"- {row['name']}: ₹{price} (Rating: {rating})"
             )
 
-
+        logger.info(f"[list_products_node] Listed {len(rows)} products")
+        log_node_exit(logger, "list_products_node", ["products", "confidence"])
         return {
             "products": rows,
             "confidence": 0.9
@@ -297,12 +371,9 @@ async def list_products_node(state: GraphState):
 
     # ---------------- FALLBACK ----------------
     except Exception as e:
-        print(f"[list_products_node] Error: {e}")
-
+        log_node_error(logger, "list_products_node", e)
         return {
-            "answer": (
-                "I might not have understood that perfectly 😅"
-            ),
+            "answer": "I might not have understood that perfectly 😅",
             "confidence": 0.4
         }
 
@@ -317,6 +388,7 @@ async def comparison_node(state: GraphState):
     - Execute safely
     - Use LLM only for explanation
     """
+    log_node_entry(logger, "comparison_node", list(state.keys()))
     query = state["query"]
     
     try:
@@ -358,7 +430,7 @@ async def comparison_node(state: GraphState):
         try:
             await validate_sql(sql)
         except ValueError as ve:
-            print(f"[comparison_node] SQL validation failed: {ve}")
+            logger.warning(f"[comparison_node] SQL validation failed: {ve}")
             sql = """
                 SELECT 
                     id, name, selling_price, description,
@@ -408,18 +480,19 @@ async def comparison_node(state: GraphState):
         
         explanation = await llm.ainvoke(explanation_prompt)
         
+        logger.info(f"[comparison_node] Comparison generated successfully")
+        log_node_exit(logger, "comparison_node", ["answer", "confidence"])
         return {
             "answer": explanation.content.strip(),
             "confidence": 0.8
         }
         
     except Exception as e:
-        print(f"[comparison_node] Error: {e}")
+        log_node_error(logger, "comparison_node", e)
         return {
             "answer": "I'm sorry, I couldn't complete the comparison. Please try rephrasing your question.",
             "confidence": 0.0
         }
-
 
 
 # ---------- CONTEXT RESOLUTION (FOLLOW-UP QUERIES) ----------
@@ -439,33 +512,39 @@ async def resolve_query_context(
     
     Returns: (resolved_query, context_used)
     """
-    ambiguous_patterns = [
-        r"\b(this|that|it|its|the)\s+(product|item|one)\b",
-        r"\b(what about|how about|and the|tell me more)\b",
-        r"^(price|cost|reviews?|rating|details?)\?*$",
-    ]
-    
-    is_ambiguous = any(
-        re.search(pattern, query.lower()) 
-        for pattern in ambiguous_patterns
-    )
-    
-    if not is_ambiguous:
+    try:
+        logger.debug(f"[resolve_query_context] Checking: {query[:50]}...")
+        ambiguous_patterns = [
+            r"\b(this|that|it|its|the)\s+(product|item|one)\b",
+            r"\b(what about|how about|and the|tell me more)\b",
+            r"^(price|cost|reviews?|rating|details?)\?*$",
+        ]
+        
+        is_ambiguous = any(
+            re.search(pattern, query.lower()) 
+            for pattern in ambiguous_patterns
+        )
+        
+        if not is_ambiguous:
+            return query, {}
+        
+        last_product = await get_session_context(user_id, thread_id, "last_product")
+        
+        if last_product and last_product.get("name"):
+            product_name = last_product["name"]
+            resolved = f"{query} (referring to {product_name})"
+            logger.debug(f"[resolve_query_context] Resolved to: {resolved}")
+            return resolved, {"resolved_from": "last_product", "product": product_name}
+        
+        stm = await get_stm(user_id, thread_id, limit=3)
+        for msg in reversed(stm):
+            if msg.get("role") == "user":
+                return query, {"fallback": "no_context"}
+        
         return query, {}
-    
-    last_product = await get_session_context(user_id, thread_id, "last_product")
-    
-    if last_product and last_product.get("name"):
-        product_name = last_product["name"]
-        resolved = f"{query} (referring to {product_name})"
-        return resolved, {"resolved_from": "last_product", "product": product_name}
-    
-    stm = await get_stm(user_id, thread_id, limit=3)
-    for msg in reversed(stm):
-        if msg.get("role") == "user":
-            return query, {"fallback": "no_context"}
-    
-    return query, {}
+    except Exception as e:
+        log_node_error(logger, "resolve_query_context", e)
+        return query, {}
 
 
 # ---------- MAIN LLM CALL ----------
@@ -475,94 +554,94 @@ async def generate_answer(
     runtime: Runtime[RuntimeContext],
     config: RunnableConfig
 ):
-    user_id = runtime.context.user_id or "anonymous"
-    thread_id = runtime.context.thread_id or config["configurable"].get("thread_id", "default")
-    
-    await touch_session(user_id, thread_id)
-
-    history = await get_history(user_id, thread_id, scope="user", limit=5)
-    stm = await get_stm(user_id, thread_id, limit=5)
-    
-    memory_messages = []
-    for m in stm:
-        memory_messages.append(f"{m['role']}: {m['content']}")
-    
-    if len(stm) < 3:
-        for m in history:
-            memory_messages.append(f"{m['role']}: {m['content']}")
-    
-    memory = "\n".join(memory_messages[-5:]) 
-
-    resolved_query, resolution_info = await resolve_query_context(
-        state["query"], user_id, thread_id
-    )
-    
-    if resolution_info.get("fallback") == "no_context":
-        pass  
-
-    products = state.get("products", [])
-    num_products = len(products) if products else 0
-
-    prompt = f"""
-    Conversation History (Session-Scoped):
-    {memory if memory else "(New conversation)"}
-
-    VERIFIED CONTEXT (DB + DOCUMENTS):
-    {state.get("context")}
-
-    User Question:
-    {resolved_query}
-    
-    Number of Products Found: {num_products}
-    
-    Provide a helpful, accurate, and concise answer based on the VERIFIED CONTEXT above.
-    
-    MULTI-PRODUCT GUIDELINES:
-    - If multiple products are found, summarize them and highlight key differences
-    - Recommend the best option based on ratings, price, or relevance when appropriate
-    - Support follow-up queries like "the cheapest", "second product", "compare these"
-    - If products are equally relevant, ask the user for preferences
-    - Reference products by their number (Product 1, Product 2, etc.) when comparing
-    
-    Order Details:
-    - The user can order products, track shipments, and manage returns.
-    - The user can cancel orders, track shipments, and return products.
-    - The user can do cash on delivery, online payments.
-    
-    Application Details:
-    - E-commerce assistant for product info, policies, comparisons, and support.
-    - In this application, the users can ask about products, company policies, compare items, and seek help with issues.
-
-    RULES:
-    - Prefer DB facts over documents
-    - Use documents only for explanations
-    - No hallucinations
-    - Say clearly if info is missing
-    - If the query is ambiguous and you lack context, ask for clarification
-    - If unrelated, politely refuse
-    - Do not explain the rules in the answer
-    - Do not explain the database structure
-    - Explain in non-technical terms
-    - Never mention session IDs, thread IDs, or internal identifiers
-    - If asked about the application or website, describe it based on the application details above
-    - If asked about internal details of the database, server, or application, refuse politely
-    - Do not reveal any internal system information
-    
-    If the product is food/edible, include approximate nutrition per 100g based on the given products list:
-    - Calories
-    - Protein  
-    - Carbs
-    - Key nutrients
-    
-    Use bullet points and emojis for readability.
-    Keep each product explanation concise (3-4 lines max).
-    NEVER make medical claims. Use phrases like "may help" or "good source of".
-    Format in clean markdown.
-
-    Answer:
-    """
-
+    log_node_entry(logger, "generate_answer", list(state.keys()))
     try:
+        user_id = runtime.context.user_id or "anonymous"
+        thread_id = runtime.context.thread_id or config["configurable"].get("thread_id", "default")
+        
+        await touch_session(user_id, thread_id)
+
+        history = await get_history(user_id, thread_id, scope="user", limit=5)
+        stm = await get_stm(user_id, thread_id, limit=5)
+    
+        memory_messages = []
+        for m in stm:
+            memory_messages.append(f"{m['role']}: {m['content']}")
+        
+        if len(stm) < 3:
+            for m in history:
+                memory_messages.append(f"{m['role']}: {m['content']}")
+        
+        memory = "\n".join(memory_messages[-5:]) 
+
+        resolved_query, resolution_info = await resolve_query_context(
+            state["query"], user_id, thread_id
+        )
+        
+        if resolution_info.get("fallback") == "no_context":
+            pass  
+
+        products = state.get("products", [])
+        num_products = len(products) if products else 0
+
+        prompt = f"""
+        Conversation History (Session-Scoped):
+        {memory if memory else "(New conversation)"}
+
+        VERIFIED CONTEXT (Authoritative Data – Highest Priority):
+        {state.get("context")}
+
+        User Question:
+        {resolved_query}
+
+        Number of Products Found: {num_products}
+
+        INSTRUCTIONS (CRITICAL):
+
+        - You MUST ONLY use information explicitly present in VERIFIED CONTEXT
+        - NEVER introduce products, categories, attributes, or facts not present
+        - NEVER rely on prior knowledge or guess missing details
+        - If VERIFIED CONTEXT does not contain relevant products, say so clearly
+        - If product details are incomplete, state what is missing
+        - Do NOT invent nutritional values
+        - Do NOT invent product names
+        - Do NOT assume products exist
+
+        MULTI-PRODUCT GUIDELINES:
+
+        - Reference products EXACTLY as provided
+        - Use Product 1 / Product 2 numbering ONLY if multiple products exist in context
+        - Highlight differences ONLY if those differences appear in context
+        - If multiple products exist but no ranking data is provided, ask for preference
+
+        DOMAIN RULES:
+
+        - Prefer VERIFIED CONTEXT over conversation history
+        - Use conversation history only for disambiguation
+        - NEVER hallucinate
+        - NEVER generalize beyond provided data
+
+        RESPONSE STYLE:
+
+        - Use bullet points and emojis for readability
+        - Keep explanations concise
+        - Use non-technical language
+        - If no products found → respond naturally (do NOT fabricate examples)
+
+        FOOD / NUTRITION RULE (STRICT):
+
+        - Provide nutrition ONLY if nutrition data exists in VERIFIED CONTEXT
+        - If absent → say "Nutrition information is not available"
+
+        SAFETY RULES:
+
+        - No medical claims
+        - No internal system details
+        - No database/schema explanations
+
+        Answer:
+        """
+
         response = await llm.ainvoke(prompt)
         answer = response.content.strip()
 
@@ -584,13 +663,15 @@ async def generate_answer(
                 {"products": products, "count": len(products)}
             )
 
+        logger.info(f"[generate_answer] Answer generated, {len(products)} products")
+        log_node_exit(logger, "generate_answer", ["answer", "products"])
         return {
             "answer": answer,
             "products": products
         }
         
     except Exception as e:
-        print(f"[generate_answer] LLM invocation failed: {e}")
+        log_node_error(logger, "generate_answer", e)
         return {
             "answer": "I'm sorry, I'm unable to process your request at the moment.",
             "products": [] 
@@ -603,8 +684,9 @@ async def blocked_query_node(
     runtime: Runtime[RuntimeContext],
     config: RunnableConfig
 ):
-    
-    system_prompt = """
+    log_node_entry(logger, "blocked_query_node", list(state.keys()))
+    try:
+        system_prompt = """
     You are a friendly but strict AI assistant for an e-commerce platform.
 
     Your role:
@@ -636,28 +718,49 @@ async def blocked_query_node(
     
     NOTE: Randomize the humor slightly each time while keeping the same friendly tone.
     """
-    response = await llm.ainvoke(
-        system_prompt + f"\n\nUser Question:\n{state['query']}"
-    )
+        response = await llm.ainvoke(
+            system_prompt + f"\n\nUser Question:\n{state['query']}"
+        )
 
-    return {
-        "answer": response.content.strip(),
-        "products": [] 
-    }  
+        logger.info(f"[blocked_query_node] Blocked query handled")
+        log_node_exit(logger, "blocked_query_node", ["answer", "products"])
+        return {
+            "answer": response.content.strip(),
+            "products": [] 
+        }
+    except Exception as e:
+        log_node_error(logger, "blocked_query_node", e)
+        return {
+            "answer": "I can help you find great products! What are you looking for?",
+            "products": []
+        }
 
 # ---------- CONFIDENCE CHECK ----------
 @traceable(name="confidence_check")
 async def confidence_check(state: GraphState):
-    response = await llm.ainvoke(
-        f"Give a confidence score between 0.0 and 1.0:\n{state['answer']}"
-    )
+    log_node_entry(logger, "confidence_check", list(state.keys()))
+    try:
+        response = await llm.ainvoke(
+            f"Give a confidence score between 0.0 and 1.0:\n{state['answer']}"
+        )
 
-    match = re.search(r"(0\.\d+|1\.0)", response.content)
-    return {
-        "confidence": float(match.group()) if match else 0.6,
-        "answer": state.get("answer"),
-        "products": state.get("products", []) 
-    }
+        match = re.search(r"(0\.\d+|1\.0)", response.content)
+        confidence = float(match.group()) if match else 0.6
+        
+        logger.info(f"[confidence_check] Confidence: {confidence}")
+        log_node_exit(logger, "confidence_check", ["confidence", "answer", "products"])
+        return {
+            "confidence": confidence,
+            "answer": state.get("answer"),
+            "products": state.get("products", []) 
+        }
+    except Exception as e:
+        log_node_error(logger, "confidence_check", e)
+        return {
+            "confidence": 0.5,
+            "answer": state.get("answer"),
+            "products": state.get("products", [])
+        }
 
 
 # ---------- GRAPH ----------
@@ -684,7 +787,7 @@ builder.add_conditional_edges(
         "policy_info": "policy_db",
         "list_products": "list_products",
         "comparison": "comparison",
-        "normal_query": "rag",
+        "normal_query": "list_products",
         "blocked_query": "blocked_query"
     }
 )

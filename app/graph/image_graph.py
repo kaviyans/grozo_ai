@@ -1,103 +1,140 @@
 import re
+import json
+from sqlalchemy import text
 from langgraph.graph import StateGraph, END
 from langgraph.runtime import Runtime
 from langsmith import traceable
-from sqlalchemy import text
-
 
 from app.core.runtime import RuntimeContext
 from app.core.model import get_llm
+from app.core.schema import DB_SCHEMA
+from app.core.state import ImageGraphState
+from app.core.logging_config import get_graph_logger, log_node_entry, log_node_exit, log_node_error
 
 from app.vision.image_analyzer import analyze_product_image
 from app.vision.query_normalizer import normalize_product_query
-from app.data.query import retrieve_products, retrieve_reviews
 from app.web.web_search import search_product_online
 from app.utils.sql_validator import sanitize_sql, validate_sql
-from app.core.schema import DB_SCHEMA
-
-from app.core.state import ImageGraphState 
 
 
-# ---------- LLM MODEL ----------
+# ---------- LOGGER ----------
+logger = get_graph_logger("image_graph")
+
+
+# ---------- LLM ----------
 llm = get_llm()
 
 
-# ---------- ANALYZE IMAGE ----------
+# ---------- IMAGE ANALYSIS ----------
 @traceable(name="image_analysis_node")
 async def image_analysis_node(state: ImageGraphState):
-    desc = await analyze_product_image(state["image_url"])
-    return {"product_description": desc}
+    log_node_entry(logger, "image_analysis_node", list(state.keys()))
+    try:
+        desc = await analyze_product_image(state["image_url"])
+        logger.info(f"[image_analysis_node] Product description extracted")
+        log_node_exit(logger, "image_analysis_node", ["product_description"])
+        return {"product_description": desc}
+    except Exception as e:
+        log_node_error(logger, "image_analysis_node", e)
+        return {"product_description": "Unable to analyze image"}
 
 
-# ---------- NORMALIZE QUERY ----------
+# ---------- QUERY NORMALIZATION ----------
 @traceable(name="normalize_query_node")
 async def normalize_query_node(state: ImageGraphState):
-    query = await normalize_product_query(state["product_description"])
-    return {"normalized_query": query}
+    log_node_entry(logger, "normalize_query_node", list(state.keys()))
+    try:
+        query = await normalize_product_query(state["product_description"])
+        logger.info(f"[normalize_query_node] Query normalized")
+        log_node_exit(logger, "normalize_query_node", ["normalized_query"])
+        return {"normalized_query": query}
+    except Exception as e:
+        log_node_error(logger, "normalize_query_node", e)
+        return {"normalized_query": state.get("product_description", "")}
 
 
+# ---------- SQL HARDENER ----------
 def enforce_tag_aggregation(sql: str) -> str:
-    # Fix common LLM mistake: ptm.name → pt.name
+    """
+    Force safe STRING_AGG usage regardless of LLM mistakes.
+    Prevents PostgreSQL datatype errors.
+    """
+
     sql = re.sub(
-        r"STRING_AGG\s*\(\s*ptm\.name",
-        "STRING_AGG(DISTINCT pt.name",
+        r"STRING_AGG\s*\([^)]+\)\s+AS\s+tags",
+        "STRING_AGG(DISTINCT pt.name, ', ') AS tags",
         sql,
         flags=re.IGNORECASE
     )
+
     return sql
 
 
+# ---------- KEYWORD EXTRACTION ----------
 @traceable(name="extract_keywords_node")
 async def extract_keywords_node(state: ImageGraphState):
-    description = state.get("product_description")
-
-    if not description:
-        return {"keywords": []}
-
-    prompt = f"""
-    You are an expert e-commerce product analyst.
-
-    Given this product description (from an image):
-
-    "{description}"
-
-    Task:
-    - Extract 3 to 6 SHORT, searchable keywords
-    - Keywords should help find the SAME product in a database
-    - Prefer: brand, product type, variant, key ingredient, use-case
-    - Use lowercase
-    - No explanations
-
-    Return STRICT JSON only in this format:
-    {{ "keywords": ["keyword1", "keyword2", "..."] }}
-    """
-
-    result = await llm.ainvoke(prompt)
-
+    log_node_entry(logger, "extract_keywords_node", list(state.keys()))
     try:
-        data = json.loads(result.content)
-        return {"keywords": data.get("keywords", [])}
-    except Exception:
+        description = state.get("product_description")
+
+        if not description:
+            logger.info("[extract_keywords_node] No description, returning empty keywords")
+            log_node_exit(logger, "extract_keywords_node", ["keywords"])
+            return {"keywords": []}
+
+        prompt = f"""
+You are an expert e-commerce product classifier.
+
+Product description from image:
+"{description}"
+
+Task:
+- Extract 3 to 6 highly searchable keywords
+- Use only lowercase words
+- Focus on product type, brand, variant, attributes
+- No explanations
+
+Return STRICT JSON:
+
+{{ "keywords": ["keyword1", "keyword2"] }}
+"""
+
+        result = await llm.ainvoke(prompt)
+
+        try:
+            data = json.loads(result.content)
+            keywords = data.get("keywords", [])
+            logger.info(f"[extract_keywords_node] Extracted {len(keywords)} keywords")
+            log_node_exit(logger, "extract_keywords_node", ["keywords"])
+            return {"keywords": keywords}
+        except Exception:
+            logger.warning("[extract_keywords_node] Failed to parse keywords JSON")
+            log_node_exit(logger, "extract_keywords_node", ["keywords"])
+            return {"keywords": []}
+    except Exception as e:
+        log_node_error(logger, "extract_keywords_node", e)
         return {"keywords": []}
 
 
+# ---------- SQL KEYWORD INJECTION ----------
 def inject_keywords_into_sql(sql: str, keywords: list[str]) -> str:
+
     if not keywords:
         return sql
 
-    conditions = []
-    for kw in keywords:
-        kw = kw.replace("'", "")  # basic safety
-        conditions.append(
-            f"""
-            LOWER(p.name) LIKE '%{kw}%'
-            OR LOWER(p.description) LIKE '%{kw}%'
-            OR LOWER(c.name) LIKE '%{kw}%'
-            OR LOWER(pt.name) LIKE '%{kw}%'
-            """
-        )
+    safe_conditions = []
 
-    keyword_filter = " OR ".join(f"({c})" for c in conditions)
+    for kw in keywords:
+        kw = re.sub(r"[^a-zA-Z0-9\s]", "", kw)
+
+        safe_conditions.append(f"""
+            LOWER(p.name) LIKE '%{kw.lower()}%'
+            OR LOWER(p.description) LIKE '%{kw.lower()}%'
+            OR LOWER(c.name) LIKE '%{kw.lower()}%'
+            OR LOWER(pt.name) LIKE '%{kw.lower()}%'
+        """)
+
+    keyword_filter = " OR ".join(f"({c})" for c in safe_conditions)
 
     return sql.replace(
         "WHERE",
@@ -112,68 +149,74 @@ async def product_retrieval_node(
     state: ImageGraphState,
     runtime: Runtime[RuntimeContext]
 ):
+    log_node_entry(logger, "product_retrieval_node", list(state.keys()))
     db = runtime.context.db
-    image_description = state.get("product_description")
+    description = state.get("product_description")
 
-    if not image_description:
+    if not description:
+        logger.warning("[product_retrieval_node] No product description")
+        log_node_exit(logger, "product_retrieval_node", ["answer", "confidence"])
         return {
-            "answer": "I couldn't understand the product clearly from the image.",
+            "answer": "I couldn't understand the product from the image.",
             "confidence": 0.3
         }
 
     try:
-        # ---------- LLM SQL GENERATION ----------
+
         prompt = f"""
-        You are an expert PostgreSQL query generator for an e-commerce platform.
+    You are a PostgreSQL expert for an e-commerce platform.
 
-        Database schema:
-        {DB_SCHEMA}
+    Database schema:
+    {DB_SCHEMA}
 
-        Image-derived product description:
-        "{image_description}"
+    User intent:
+    Find products matching this description:
 
-        Rules:
-        - ONLY SELECT queries
-        - Always filter p.deleted_at IS NULL
-        - Prefer p.stock > 0
-        - LEFT JOIN categories & tags
-        - Aggregate tags using STRING_AGG
-        - One row per product (GROUP BY)
-        - LIMIT 5
-        - Output ONLY SQL
-        """
+    "{description}"
+
+    STRICT RULES:
+    - Output ONLY SQL
+    - SELECT queries only
+    - Always filter: p.deleted_at IS NULL
+    - Prefer: p.stock > 0
+    - LEFT JOIN categories & tags
+    - Aggregate tags using STRING_AGG(DISTINCT pt.name, ', ')
+    - One row per product
+    - LIMIT 5
+    """
 
         llm_result = await llm.ainvoke(prompt)
         raw_sql = llm_result.content.strip()
 
-        # ---------- SANITIZE ----------
         sql = sanitize_sql(raw_sql)
         sql = enforce_tag_aggregation(sql)
         sql = inject_keywords_into_sql(sql, state.get("keywords", []))
 
-        # ---------- VALIDATE ----------
         await validate_sql(sql)
 
-        # ---------- EXECUTE (FIX HERE) ----------
         result = await db.execute(text(sql))
         rows = result.mappings().all()
 
         if not rows:
+            logger.info("[product_retrieval_node] No matching products found")
+            log_node_exit(logger, "product_retrieval_node", ["answer", "confidence"])
             return {
-                "answer": "I couldn't find matching products for this image.",
+                "answer": "No matching products found.",
                 "confidence": 0.4
             }
+            
+        logger.info(f"[product_retrieval_node] Found {len(rows)} products")
+        log_node_exit(logger, "product_retrieval_node", ["product_docs", "num_products"])
 
         return {
             "product_docs": rows,
-            "confidence": 0.9
+            "num_products": len(rows)
         }
 
     except Exception as e:
-        print(f"[image_product_retrieval_node] Error:", e)
-
+        log_node_error(logger, "product_retrieval_node", e)
         return {
-            "answer": "Something went wrong while analyzing the image.",
+            "answer": "Something went wrong while searching for products.",
             "confidence": 0.2
         }
 
@@ -181,69 +224,117 @@ async def product_retrieval_node(
 # ---------- WEB FALLBACK ----------
 @traceable(name="web_fallback_node")
 async def web_fallback_node(state: ImageGraphState):
-    if state.get("product_docs"):
-        return {}
+    log_node_entry(logger, "web_fallback_node", list(state.keys()))
+    try:
+        if state.get("product_docs"):
+            logger.info("[web_fallback_node] Products found, skipping web search")
+            log_node_exit(logger, "web_fallback_node", [])
+            return {}
 
-    web_docs = await search_product_online(state["normalized_query"])
-    return {"web_docs": web_docs}
+        web_docs = await search_product_online(state["normalized_query"])
+        logger.info(f"[web_fallback_node] Web search completed")
+        log_node_exit(logger, "web_fallback_node", ["web_docs"])
+        return {"web_docs": web_docs}
+    except Exception as e:
+        log_node_error(logger, "web_fallback_node", e)
+        return {"web_docs": []}
 
 
-# ---------- ASSEMBER ----------
+# ---------- CONTEXT ASSEMBLY ----------
 @traceable(name="assemble_context_node")
 async def assemble_context_node(state: ImageGraphState):
-    sections = []
+    log_node_entry(logger, "assemble_context_node", list(state.keys()))
+    try:
+        sections = []
 
-    sections.append(f"Identified Product:\n{state['product_description']}")
+        sections.append(f"Identified Product:\n{state.get('product_description')}")
 
-    if state.get("product_docs"):
-        sections.append(f"Product Info:\n{state['product_docs']}")
+        if state.get("product_docs"):
+            sections.append(f"Database Products:\n{state['product_docs']}")
 
-    if state.get("review_docs"):
-        sections.append(f"Reviews:\n{state['review_docs']}")
+        if state.get("web_docs"):
+            sections.append(f"Web Results:\n{state['web_docs']}")
 
-    if state.get("web_docs"):
-        sections.append(f"Online Information:\n{state['web_docs']}")
+        logger.info(f"[assemble_context_node] Assembled {len(sections)} sections")
+        log_node_exit(logger, "assemble_context_node", ["context"])
+        return {"context": "\n\n".join(sections)}
+    except Exception as e:
+        log_node_error(logger, "assemble_context_node", e)
+        return {"context": "Error assembling context"}
 
-    return {"context": "\n\n".join(sections)}
 
-
-# ---------- MAIN LLM CALL ----------
+# ---------- ANSWER GENERATION (PRODUCTION PROMPT) ----------
 @traceable(name="generate_answer_node", run_type="llm")
 async def generate_answer_node(state: ImageGraphState):
-    prompt = f"""
-    Use ONLY the provided context.
+    log_node_entry(logger, "generate_answer_node", list(state.keys()))
+    try:
+        context = state.get("context")
+        resolved_query = state.get("question", "What is this product?")
+        num_products = state.get("num_products", 0)
+        memory = state.get("memory")
 
-    {state["context"]}
+        prompt = f"""
+    Conversation History:
+    {memory if memory else "(new conversation)"}
 
-    Question:
-    {state.get("question", "What is this product? Give pros and cons.")}
+    Verified Context:
+    {context}
 
-    Rules:
+    User Question:
+    {resolved_query}
+
+    Number of Products Found: {num_products}
+
+    Instructions:
+
+    MULTI-PRODUCT BEHAVIOR:
+    - If multiple products exist → compare & differentiate
+    - Highlight price, ratings, usefulness
+    - Recommend when clear winner exists
+    - If ambiguous → ask preference
+
+    STYLE:
+    - Use bullet points
+    - Use friendly e-commerce tone
+    - Keep concise & helpful
     - No hallucinations
-    - If information is missing, say so clearly
-    - Explain in simple, non-technical language
-    - If unrelated, politely refuse
-    - Do not explain the rules
-    - Do not explain the database structure
-    - Explain in non-technical terms
+    - No database/internal discussion
+    - No medical claims
+    - If info missing → say clearly
+
+    If edible product:
+    Include approx nutrition per 100g (only if relevant)
 
     Answer:
     """
 
-    response = await llm.ainvoke(prompt)
-    return {"answer": response.content.strip()}
+        response = await llm.ainvoke(prompt)
+        logger.info("[generate_answer_node] Answer generated")
+        log_node_exit(logger, "generate_answer_node", ["answer"])
+        return {"answer": response.content.strip()}
+    except Exception as e:
+        log_node_error(logger, "generate_answer_node", e)
+        return {"answer": "I'm sorry, I couldn't generate a response. Please try again."}
 
 
-
+# ---------- CONFIDENCE ----------
 @traceable(name="confidence_node")
 async def confidence_node(state: ImageGraphState):
-    response = await llm.ainvoke(
-        f"Rate confidence from 0.0 to 1.0:\n{state['answer']}"
-    )
+    log_node_entry(logger, "confidence_node", list(state.keys()))
+    try:
+        response = await llm.ainvoke(
+            f"Rate confidence from 0.0 to 1.0 for this answer:\n{state['answer']}"
+        )
 
-    match = re.search(r"(0\.\d+|1\.0)", response.content)
-    return {"confidence": float(match.group()) if match else 0.6}
-
+        match = re.search(r"(0\.\d+|1\.0)", response.content)
+        confidence = float(match.group()) if match else 0.6
+        
+        logger.info(f"[confidence_node] Confidence: {confidence}")
+        log_node_exit(logger, "confidence_node", ["confidence", "products"])
+        return {"confidence": confidence, "products": state.get("product_docs", [])}
+    except Exception as e:
+        log_node_error(logger, "confidence_node", e)
+        return {"confidence": 0.5, "products": state.get("product_docs", [])}
 
 
 # ---------- GRAPH ----------

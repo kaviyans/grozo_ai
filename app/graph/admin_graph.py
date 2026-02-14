@@ -1,3 +1,5 @@
+import re
+import asyncio
 from langgraph.graph import StateGraph, END
 from langchain_core.runnables import RunnableConfig
 from langsmith import traceable
@@ -22,7 +24,15 @@ from app.memory.short_term import (
     get_stm,
     touch_session
 )
+from app.core.logging_config import (
+    get_graph_logger,
+    log_node_entry,
+    log_node_exit,
+    log_node_error
+)
 
+# ---------- LOGGER ----------
+logger = get_graph_logger("admin_graph")
 
 # ---------- LLM MODEL ----------
 llm = get_llm()
@@ -31,46 +41,68 @@ llm = get_llm()
 vector_db = get_vector_db()
 
 
+# ---------- ASYNC VECTOR SEARCH ----------
+async def async_admin_vector_search(query: str, k: int = 6):
+    """Run vector search in a thread pool to make it async."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, lambda: vector_db.similarity_search(query, k=k))
+
+
 # ---------- PRIVACY CHECK (FIRST LINE OF DEFENSE) ----------
 @traceable(name="privacy_check_node")
 async def privacy_check_node(state: AdminState):
-    query_lower = state["query"].lower()
-    
-    for field in FORBIDDEN_FIELDS:
-        if field in query_lower:
-            return {
-                "privacy_violation": f"Access to '{field}' is not permitted",
-                "is_safe": False
-            }
-    
-    privacy_patterns = [
-        "password",
-        "show me user email",
-        "list all emails",
-        "phone number",
-        "user otp",
-        "session token",
-        "authentication",
-        "login credentials"
-    ]
-    
-    for pattern in privacy_patterns:
-        if pattern in query_lower:
-            return {
-                "privacy_violation": "This query attempts to access protected user data",
-                "is_safe": False
-            }
-    
-    return {"is_safe": True, "privacy_violation": None}
+    log_node_entry(logger, "privacy_check_node", list(state.keys()))
+    try:
+        query_lower = state["query"].lower()
+        
+        for field in FORBIDDEN_FIELDS:
+            if field in query_lower:
+                logger.warning(f"[privacy_check_node] Privacy violation: {field}")
+                log_node_exit(logger, "privacy_check_node", ["privacy_violation", "is_safe"])
+                return {
+                    "privacy_violation": f"Access to '{field}' is not permitted",
+                    "is_safe": False
+                }
+        
+        privacy_patterns = [
+            "password",
+            "show me user email",
+            "list all emails",
+            "phone number",
+            "user otp",
+            "session token",
+            "authentication",
+            "login credentials"
+        ]
+        
+        for pattern in privacy_patterns:
+            if pattern in query_lower:
+                logger.warning(f"[privacy_check_node] Privacy pattern detected: {pattern}")
+                log_node_exit(logger, "privacy_check_node", ["privacy_violation", "is_safe"])
+                return {
+                    "privacy_violation": "This query attempts to access protected user data",
+                    "is_safe": False
+                }
+        
+        logger.info("[privacy_check_node] Query is safe")
+        log_node_exit(logger, "privacy_check_node", ["is_safe", "privacy_violation"])
+        return {"is_safe": True, "privacy_violation": None}
+    except Exception as e:
+        log_node_error(logger, "privacy_check_node", e)
+        return {"is_safe": False, "privacy_violation": "Error checking query safety"}
 
 
 # ---------- INTENT DETECTION ----------
 @traceable(name="detect_admin_intent")
 async def detect_admin_intent(state: AdminState):
-    if not state.get("is_safe", True):
-        return {"intent": "privacy_blocked"}
-    
-    prompt = f"""
+    log_node_entry(logger, "detect_admin_intent", list(state.keys()))
+    try:
+        if not state.get("is_safe", True):
+            logger.info("[detect_admin_intent] Intent: privacy_blocked")
+            log_node_exit(logger, "detect_admin_intent", ["intent"])
+            return {"intent": "privacy_blocked"}
+        
+        prompt = f"""
     You are an intent classifier for an e-commerce admin assistant.
     
     Classify the query into EXACTLY ONE intent:
@@ -130,16 +162,20 @@ async def detect_admin_intent(state: AdminState):
     
     Return ONLY the intent label. No explanation.
     """
-    
-    response = await llm.ainvoke(prompt)
-    intent = response.content.strip().lower().replace(" ", "_")
-    
-    # Validate intent
-    if intent not in ADMIN_INTENTS:
-        intent = "general_query"
-    
-    print(f"[Admin Intent] {intent}")
-    return {"intent": intent}
+        
+        response = await llm.ainvoke(prompt)
+        intent = response.content.strip().lower().replace(" ", "_")
+        
+        # Validate intent
+        if intent not in ADMIN_INTENTS:
+            intent = "general_query"
+        
+        logger.info(f"[detect_admin_intent] Intent: {intent}")
+        log_node_exit(logger, "detect_admin_intent", ["intent"])
+        return {"intent": intent}
+    except Exception as e:
+        log_node_error(logger, "detect_admin_intent", e)
+        return {"intent": "general_query"}
 
 
 # ---------- SQL GENERATION NODE ----------
@@ -149,12 +185,16 @@ async def generate_admin_sql_node(state: AdminState):
     Generate SQL for database operations.
     Only runs for DB-related intents.
     """
-    intent = state.get("intent", "general_query")
-    
-    if intent in ["system_policy", "general_query", "privacy_blocked"]:
-        return {"generated_sql": None, "sql_validated": False}
-    
-    prompt = f"""
+    log_node_entry(logger, "generate_admin_sql_node", list(state.keys()))
+    try:
+        intent = state.get("intent", "general_query")
+        
+        if intent in ["system_policy", "general_query", "privacy_blocked"]:
+            logger.info(f"[generate_admin_sql_node] Skipping SQL for intent: {intent}")
+            log_node_exit(logger, "generate_admin_sql_node", ["generated_sql", "sql_validated"])
+            return {"generated_sql": None, "sql_validated": False}
+        
+        prompt = f"""
     You are a PostgreSQL expert for an e-commerce admin system.
     
     Database Schema:
@@ -190,14 +230,18 @@ async def generate_admin_sql_node(state: AdminState):
     
     Generate the SQL:
     """
-    
-    response = await llm.ainvoke(prompt)
-    raw_sql = response.content.strip()
-    sql = sanitize_admin_sql(raw_sql)
-    
-    print(f"[Admin SQL] Generated: {sql[:100]}...")
-    
-    return {"generated_sql": sql, "sql_validated": False}
+        
+        response = await llm.ainvoke(prompt)
+        raw_sql = response.content.strip()
+        sql = sanitize_admin_sql(raw_sql)
+        
+        logger.info(f"[generate_admin_sql_node] Generated SQL: {sql[:100]}...")
+        log_node_exit(logger, "generate_admin_sql_node", ["generated_sql", "sql_validated"])
+        
+        return {"generated_sql": sql, "sql_validated": False}
+    except Exception as e:
+        log_node_error(logger, "generate_admin_sql_node", e)
+        return {"generated_sql": None, "sql_validated": False, "sql_error": "Failed to generate SQL"}
 
 
 # ---------- SQL VALIDATION NODE ----------
@@ -206,23 +250,33 @@ async def validate_sql_node(state: AdminState):
     """
     Validate generated SQL against security rules.
     """
-    sql = state.get("generated_sql")
-    intent = state.get("intent", "general_query")
-    
-    if not sql:
-        return {"sql_validated": False, "sql_error": None}
-    
-    is_valid, error = await validate_admin_sql(sql, intent)
-    
-    if not is_valid:
-        print(f"[Admin SQL] Validation failed: {error}")
-        return {
-            "sql_validated": False,
-            "sql_error": error,
-            "generated_sql": None  
-        }
-    
-    return {"sql_validated": True, "sql_error": None}
+    log_node_entry(logger, "validate_sql_node", list(state.keys()))
+    try:
+        sql = state.get("generated_sql")
+        intent = state.get("intent", "general_query")
+        
+        if not sql:
+            logger.info("[validate_sql_node] No SQL to validate")
+            log_node_exit(logger, "validate_sql_node", ["sql_validated", "sql_error"])
+            return {"sql_validated": False, "sql_error": None}
+        
+        is_valid, error = await validate_admin_sql(sql, intent)
+        
+        if not is_valid:
+            logger.warning(f"[validate_sql_node] Validation failed: {error}")
+            log_node_exit(logger, "validate_sql_node", ["sql_validated", "sql_error", "generated_sql"])
+            return {
+                "sql_validated": False,
+                "sql_error": error,
+                "generated_sql": None  
+            }
+        
+        logger.info("[validate_sql_node] SQL validated successfully")
+        log_node_exit(logger, "validate_sql_node", ["sql_validated", "sql_error"])
+        return {"sql_validated": True, "sql_error": None}
+    except Exception as e:
+        log_node_error(logger, "validate_sql_node", e)
+        return {"sql_validated": False, "sql_error": "Validation failed"}
 
 
 # ---------- SQL EXECUTION NODE ----------
@@ -231,21 +285,25 @@ async def execute_sql_node(state: AdminState):
     """
     Execute validated SQL and mask sensitive results.
     """
-    sql = state.get("generated_sql")
-    
-    if not sql or not state.get("sql_validated"):
-        return {"db_result": None}
-    
+    log_node_entry(logger, "execute_sql_node", list(state.keys()))
     try:
+        sql = state.get("generated_sql")
+        
+        if not sql or not state.get("sql_validated"):
+            logger.info("[execute_sql_node] No validated SQL to execute")
+            log_node_exit(logger, "execute_sql_node", ["db_result"])
+            return {"db_result": None}
+        
         rows = await execute_sql(sql)
         
         masked_rows = mask_result_rows(rows) if rows else []
         
-        print(f"[Admin SQL] Executed successfully, {len(masked_rows)} rows")
+        logger.info(f"[execute_sql_node] Executed successfully, {len(masked_rows)} rows")
+        log_node_exit(logger, "execute_sql_node", ["db_result"])
         return {"db_result": masked_rows}
         
     except Exception as e:
-        print(f"[Admin SQL] Execution error: {e}")
+        log_node_error(logger, "execute_sql_node", e)
         return {
             "db_result": None,
             "sql_error": "Database query failed. Please try again."
@@ -258,18 +316,27 @@ async def rag_retrieval_node(state: AdminState):
     """
     Retrieve documents for policy/system queries.
     """
-    intent = state.get("intent", "")
-    
-    if intent not in ["system_policy", "general_query"] and state.get("db_result"):
+    log_node_entry(logger, "rag_retrieval_node", list(state.keys()))
+    try:
+        intent = state.get("intent", "")
+        
+        if intent not in ["system_policy", "general_query"] and state.get("db_result"):
+            logger.info("[rag_retrieval_node] Skipping RAG - DB result available")
+            log_node_exit(logger, "rag_retrieval_node", ["documents", "rag_context"])
+            return {"documents": [], "rag_context": None}
+        
+        docs = await async_admin_vector_search(state["query"], k=6)
+        rag_context = "\n\n".join(
+            f"[{d.metadata.get('type', 'document').upper()}]\n{d.page_content}"
+            for d in docs
+        )
+        
+        logger.info(f"[rag_retrieval_node] Retrieved {len(docs)} documents")
+        log_node_exit(logger, "rag_retrieval_node", ["documents", "rag_context"])
+        return {"documents": docs, "rag_context": rag_context}
+    except Exception as e:
+        log_node_error(logger, "rag_retrieval_node", e)
         return {"documents": [], "rag_context": None}
-    
-    docs = vector_db.similarity_search(state["query"], k=6)
-    rag_context = "\n\n".join(
-        f"[{d.metadata.get('type', 'document').upper()}]\n{d.page_content}"
-        for d in docs
-    )
-    
-    return {"documents": docs, "rag_context": rag_context}
 
 
 DB_INTENTS = {
@@ -286,68 +353,82 @@ DB_INTENTS = {
 # ---------- CONTEXT ASSEMBLY NODE ----------
 @traceable(name="assemble_context_node")
 async def assemble_context_node(state: AdminState):
-    if state.get("privacy_violation"):
-        return {"context": f"SECURITY: {state['privacy_violation']}"}
-    
-    intent = state.get("intent")
+    log_node_entry(logger, "assemble_context_node", list(state.keys()))
+    try:
+        if state.get("privacy_violation"):
+            logger.info("[assemble_context_node] Privacy violation context")
+            log_node_exit(logger, "assemble_context_node", ["context"])
+            return {"context": f"SECURITY: {state['privacy_violation']}"}
+        
+        intent = state.get("intent")
 
+        if intent in DB_INTENTS and not state.get("db_result"):
+            logger.info("[assemble_context_node] No DB results for DB intent")
+            log_node_exit(logger, "assemble_context_node", ["context"])
+            return {
+                "context": (
+                    "DATABASE RESULT: NO RECORDS FOUND.\n"
+                    "YOU MUST NOT INVENT PRODUCTS, ORDERS, USERS, PRICES, OR EXAMPLES."
+                )
+            }
 
-    if intent in DB_INTENTS and not state.get("db_result"):
-        return {
-            "context": (
-                "DATABASE RESULT: NO RECORDS FOUND.\n"
-                "YOU MUST NOT INVENT PRODUCTS, ORDERS, USERS, PRICES, OR EXAMPLES."
+        sections = []
+
+        if state.get("sql_error"):
+            sections.append(f"NOTE: {state['sql_error']}")
+
+        if state.get("db_result"):
+            sections.append(
+                f"DATABASE RESULTS ({len(state['db_result'])} rows):\n{state['db_result']}"
             )
-        }
 
-    sections = []
+        if state.get("rag_context"):
+            sections.append(f"DOCUMENTS:\n{state['rag_context']}")
 
-    if state.get("sql_error"):
-        sections.append(f"NOTE: {state['sql_error']}")
-
-    if state.get("db_result"):
-        sections.append(
-            f"DATABASE RESULTS ({len(state['db_result'])} rows):\n{state['db_result']}"
-        )
-
-    if state.get("rag_context"):
-        sections.append(f"DOCUMENTS:\n{state['rag_context']}")
-
-    return {"context": "\n\n".join(sections)}
+        logger.info(f"[assemble_context_node] Assembled {len(sections)} sections")
+        log_node_exit(logger, "assemble_context_node", ["context"])
+        return {"context": "\n\n".join(sections)}
+    except Exception as e:
+        log_node_error(logger, "assemble_context_node", e)
+        return {"context": "Error assembling context"}
 
 
 # ---------- ANSWER GENERATION NODE ----------
 @traceable(name="generate_admin_answer", run_type="llm")
 async def generate_admin_answer(state: AdminState, config: RunnableConfig):
-    admin_id = config.get("configurable", {}).get("user_id", "admin")
-    thread_id = config.get("configurable", {}).get("thread_id", "default")
-    
-    await touch_session(admin_id, thread_id)
-    
-    if state.get("privacy_violation"):
-        answer = f"""I apologize, but I cannot process this request.
-
-        **Reason:** {state['privacy_violation']}
-
-        For security and privacy compliance, access to sensitive user data such as emails, phone numbers, passwords, and authentication tokens is restricted.
-
-        If you need this information for a legitimate purpose, please contact your system administrator through the proper channels."""
+    log_node_entry(logger, "generate_admin_answer", list(state.keys()))
+    try:
+        admin_id = config.get("configurable", {}).get("user_id", "admin")
+        thread_id = config.get("configurable", {}).get("thread_id", "default")
         
-        await save_message(admin_id, thread_id, "user", state["query"], scope="admin")
-        await save_message(admin_id, thread_id, "assistant", answer, scope="admin")
+        await touch_session(admin_id, thread_id)
         
-        return {"answer": answer}
-    
-    history = await get_history(admin_id, thread_id, scope="admin", limit=3)
-    stm = await get_stm(admin_id, thread_id, limit=3)
-    
-    memory_messages = [f"{m['role']}: {m['content']}" for m in stm]
-    if len(stm) < 2:
-        memory_messages.extend(f"{m['role']}: {m['content']}" for m in history)
-    
-    memory = "\n".join(memory_messages[-3:])
-    
-    prompt = f"""
+        if state.get("privacy_violation"):
+            answer = f"""I apologize, but I cannot process this request.
+
+            **Reason:** {state['privacy_violation']}
+
+            For security and privacy compliance, access to sensitive user data such as emails, phone numbers, passwords, and authentication tokens is restricted.
+
+            If you need this information for a legitimate purpose, please contact your system administrator through the proper channels."""
+            
+            await save_message(admin_id, thread_id, "user", state["query"], scope="admin")
+            await save_message(admin_id, thread_id, "assistant", answer, scope="admin")
+            
+            logger.info("[generate_admin_answer] Privacy blocked response")
+            log_node_exit(logger, "generate_admin_answer", ["answer"])
+            return {"answer": answer}
+        
+        history = await get_history(admin_id, thread_id, scope="admin", limit=3)
+        stm = await get_stm(admin_id, thread_id, limit=3)
+        
+        memory_messages = [f"{m['role']}: {m['content']}" for m in stm]
+        if len(stm) < 2:
+            memory_messages.extend(f"{m['role']}: {m['content']}" for m in history)
+        
+        memory = "\n".join(memory_messages[-3:])
+        
+        prompt = f"""
     You are an ADMIN assistant for an e-commerce platform.
     
     Session History:
@@ -413,17 +494,22 @@ async def generate_admin_answer(state: AdminState, config: RunnableConfig):
 
     Generate a helpful admin response:
     """
-    
-    response = await llm.ainvoke(prompt)
-    answer = response.content.strip()
-    
-    await add_stm(admin_id, thread_id, "user", state["query"])
-    await add_stm(admin_id, thread_id, "assistant", answer)
-    
-    await save_message(admin_id, thread_id, "user", state["query"], scope="admin")
-    await save_message(admin_id, thread_id, "assistant", answer, scope="admin")
-    
-    return {"answer": answer}
+        
+        response = await llm.ainvoke(prompt)
+        answer = response.content.strip()
+        
+        await add_stm(admin_id, thread_id, "user", state["query"])
+        await add_stm(admin_id, thread_id, "assistant", answer)
+        
+        await save_message(admin_id, thread_id, "user", state["query"], scope="admin")
+        await save_message(admin_id, thread_id, "assistant", answer, scope="admin")
+        
+        logger.info("[generate_admin_answer] Answer generated successfully")
+        log_node_exit(logger, "generate_admin_answer", ["answer"])
+        return {"answer": answer}
+    except Exception as e:
+        log_node_error(logger, "generate_admin_answer", e)
+        return {"answer": "I'm sorry, I couldn't process that request. Please try again."}
 
 
 # ---------- CONFIDENCE CHECK NODE ----------
@@ -432,33 +518,30 @@ async def confidence_check_node(state: AdminState):
     """
     Evaluate response confidence.
     """
-    response = await llm.ainvoke(
-        f"Rate confidence 0.0-1.0 for this answer. Return ONLY the number.\n\n{state['answer']}"
-    )
-    
+    log_node_entry(logger, "confidence_check_node", list(state.keys()))
     try:
-        confidence = float(response.content.strip())
+        response = await llm.ainvoke(
+            f"Rate how appropriately this answer addresses the user's query from 0.0 to 1.0.\n"
+            f"- For greetings/casual queries, a friendly response = 1.0\n"
+            f"- For data queries, accurate data response = 1.0\n"
+            f"Return ONLY a decimal number.\n\n"
+            f"Query: {state.get('query', '')}\n"
+            f"Answer: {state['answer']}"
+        )
+        
+        match = re.search(r"(0\.\d+|1\.0|0|1)", response.content.strip())
+        confidence = float(match.group()) if match else 0.8
         confidence = max(0.0, min(1.0, confidence))
-    except:
-        confidence = 0.5
-    
-    return {"confidence": confidence}
+        
+        logger.info(f"[confidence_check_node] Confidence: {confidence}")
+        log_node_exit(logger, "confidence_check_node", ["confidence"])
+        return {"confidence": confidence}
+    except Exception as e:
+        log_node_error(logger, "confidence_check_node", e)
+        return {"confidence": 0.8}
 
 
 # ---------- ROUTING FUNCTIONS ----------
-def intent_router(state: AdminState) -> str:
-    """Route based on detected intent."""
-    intent = state.get("intent", "general_query")
-    
-    if intent == "privacy_blocked":
-        return "blocked"
-    
-    if intent in ["system_policy", "general_query"]:
-        return "rag_only"
-    
-    return "sql_path"
-
-
 def sql_result_router(state: AdminState) -> str:
     """Route based on SQL execution result."""
     if state.get("db_result"):
@@ -502,11 +585,19 @@ builder.add_edge("privacy_check", "detect_intent")
 
 builder.add_conditional_edges(
     "detect_intent",    
-    intent_router,
+    lambda state: state.get("intent", "general_query"),
     {
-        "blocked": "assemble_context",   
-        "rag_only": "rag_retrieval",      
-        "sql_path": "generate_sql"       
+        "privacy_blocked": "assemble_context",
+        "system_policy": "rag_retrieval",
+        "general_query": "assemble_context",
+        "product_management": "generate_sql",
+        "order_management": "generate_sql",
+        "user_management": "generate_sql",
+        "analytics": "generate_sql",
+        "coupon_management": "generate_sql",
+        "loyalty_management": "generate_sql",
+        "notification_management": "generate_sql",
+        "product_listing": "generate_sql",
     }
 )
 

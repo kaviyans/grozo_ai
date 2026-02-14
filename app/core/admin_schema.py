@@ -349,12 +349,7 @@ FORBIDDEN_FIELDS = {
     "session_id",
     "refresh_token",
     "ip_address",
-    "user_agent",
-    "email",
-    "phone",
-    "date_of_birth",
-    "age",
-    "gender",
+    "user_agent"
 }
 
 
@@ -379,13 +374,13 @@ ADMIN_INTENTS = [
 
 # ---------- ALLOWED SQL OPERATIONS BY INTENT ----------
 INTENT_SQL_PERMISSIONS = {
-    "product_management": ["SELECT", "INSERT", "UPDATE"],
-    "order_management": ["SELECT", "UPDATE"],
+    "product_management": ["SELECT"],
+    "order_management": ["SELECT"],
     "user_management": ["SELECT"],
     "analytics": ["SELECT"],
-    "coupon_management": ["SELECT", "INSERT", "UPDATE"],
-    "loyalty_management": ["SELECT", "UPDATE"],
-    "notification_management": ["SELECT", "INSERT"],
+    "coupon_management": ["SELECT"],
+    "loyalty_management": ["SELECT"],
+    "notification_management": ["SELECT"],
     "system_policy": [], 
     "general_query": ["SELECT"],
     "product_listing": ["SELECT"]

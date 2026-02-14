@@ -2,6 +2,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
 from pymongo import MongoClient
 from dotenv import load_dotenv
+from motor.motor_asyncio import AsyncIOMotorClient
 load_dotenv()
 import os
 import cloudinary
@@ -26,10 +27,11 @@ async def get_db():
 MONGO_URL = os.getenv("MONGO_URL")
 MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "ecommerce_db")
 
-mongo_client = MongoClient(MONGO_URL)
+mongo_client = AsyncIOMotorClient(MONGO_URL)
 mongo_db = mongo_client[MONGO_DB_NAME]
 
-
+async def get_mongo_db():
+    yield mongo_db
 
 # ---------- CLOUDINARY ----------
 cloudinary.config(
