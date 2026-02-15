@@ -104,6 +104,10 @@ async def detect_intent(state: GraphState):
     - If the user query is unrelated to the e-commerce domain
     - If the user query contains hate speech, discrimination, or offensive language
 
+    6. greeting query
+    - If the user is greeting the assistant for the first time
+    - If the user is asking for help or how to use the assistant
+    - If the user is leaving the conversation or saying goodbye
 
     Classification Rules (IMPORTANT):
 
@@ -128,6 +132,7 @@ async def detect_intent(state: GraphState):
     list_products
     normal_query
     blocked_query
+    greeting_query
     """
         response = await llm.ainvoke(prompt)
         intent = response.content.strip().lower()
@@ -502,16 +507,6 @@ async def resolve_query_context(
     user_id: str,
     thread_id: str
 ) -> tuple[str, dict]:
-    """
-    Resolve ambiguous queries using session context.
-    
-    Handles:
-    - Pronouns ("this", "that", "it")
-    - Follow-up questions ("what about the price?")
-    - Context continuation
-    
-    Returns: (resolved_query, context_used)
-    """
     try:
         logger.debug(f"[resolve_query_context] Checking: {query[:50]}...")
         ambiguous_patterns = [
@@ -638,6 +633,9 @@ async def generate_answer(
         - No medical claims
         - No internal system details
         - No database/schema explanations
+        
+        GREETING AND OFF-TOPIC RULES:
+        - If the user query is a greeting or farewell → respond with a friendly message and offer help
 
         Answer:
         """
@@ -788,7 +786,8 @@ builder.add_conditional_edges(
         "list_products": "list_products",
         "comparison": "comparison",
         "normal_query": "list_products",
-        "blocked_query": "blocked_query"
+        "blocked_query": "blocked_query",
+        "greeting_query": "assemble",
     }
 )
 

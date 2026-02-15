@@ -19,8 +19,10 @@ async def unified_chat(
     image_url = None
 
 
-    if image:
-        image_url = await upload_to_cloudinary(image)
+    if image and len(image) > 0:
+        valid_images = [f for f in image if isinstance(f, UploadFile)]
+        if valid_images:
+            image_url = await upload_to_cloudinary(valid_images)
 
     thread_id = await generate_thread_id()
     
